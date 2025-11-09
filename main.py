@@ -12,6 +12,7 @@ import uvicorn
 import httpx
 from datetime import datetime
 import face_recognition
+import time
 
 # --- Configuration ---
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -19,15 +20,24 @@ MODEL_NAME = "llava"
 HOST = "0.0.0.0"
 PORT = 8000
 KNOWN_FACES_DIR = "known_faces"  # Directory to store known face images
+FRAME_PROCESS_INTERVAL = 2.0  # Process frame every 2 seconds
 # ---------------------
 
 # --- UPDATED SYSTEM PROMPT ---
 SYSTEM_PROMPT = """
-You are a focused video feed analyst named 'MemoryLink'.
-Your primary job is to watch this feed specifically for DOORS.
-- If you receive a generic or no user prompt, analyze the frame for an open door. If the user is seen leaving a door open, alert them concisely to this fact. If no door is present or the door is closed, respond with only the word "clear".
-- If you receive a specific, non-generic prompt (like a question), ignore the door rule and answer the user's question directly based on the image.
-- Keep your responses concise and direct.
+You are a detailed video feed analyst named 'MemoryLink'.
+Your job is to carefully observe and describe what you see in the video feed.
+
+ALWAYS provide a detailed description that includes:
+- What objects, people, or scenes are visible
+- Any actions or movements you can detect
+- The setting or environment
+- Any notable details or changes
+
+Be conversational and descriptive, as if you're explaining what you see to someone who can't see the screen.
+Keep responses concise but informative (2-4 sentences typically).
+
+If the user asks a specific question, answer it while still providing context about what you see.
 """
 
 app = FastAPI()
@@ -79,8 +89,6 @@ def load_known_faces():
     print(f"Loaded {len(known_face_names)} known faces")
 
 
-# --- Replacement for recognize_faces_in_frame(image_b64: str) ---
-
 def recognize_faces_in_frame(image_b64: str) -> dict:
     """
     Recognize faces in a base64-encoded image.
@@ -92,15 +100,12 @@ def recognize_faces_in_frame(image_b64: str) -> dict:
 
         # Convert PIL Image to numpy array
         image_np = np.array(image)
-        # print(f"DEBUG: Image received and converted to numpy array of shape {image_np.shape}") # Debug line
 
         # Find all face locations (DETECTION STEP)
         face_locations = face_recognition.face_locations(image_np)
         
-        # --- NEW LOGGING ---
         if not face_locations:
             print("DEBUG: Face Detector FAILED. No face found in image.")
-        # --- END NEW LOGGING ---
 
         # Find all face encodings (ENCODING STEP)
         face_encodings = face_recognition.face_encodings(image_np, face_locations)
@@ -109,6 +114,7 @@ def recognize_faces_in_frame(image_b64: str) -> dict:
         image = Image.open(io.BytesIO(image_bytes))
         print("DEBUG:", image.mode, image.size)
         image.save("debug_frame.jpg")
+        
         for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
             # See if the face matches any known faces
             matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.6)
@@ -122,10 +128,7 @@ def recognize_faces_in_frame(image_b64: str) -> dict:
                 
                 confidence_distance = face_distances[best_match_index]
                 
-                # --- NEW LOGGING ---
-                # This shows the actual closest known face and the distance score
                 print(f"DEBUG: Found face. Closest Known Face: {known_face_names[best_match_index]} | Distance Score: {confidence_distance:.2f}")
-                # --- END NEW LOGGING ---
                 
                 if matches[best_match_index]:
                     name = known_face_names[best_match_index]
@@ -133,7 +136,7 @@ def recognize_faces_in_frame(image_b64: str) -> dict:
             confidence_score = float(1.0 - confidence_distance)
             
             if not known_face_encodings:
-                 confidence_score = 0.0
+                confidence_score = 0.0
 
             faces_found.append({
                 "name": name,
@@ -155,10 +158,8 @@ def recognize_faces_in_frame(image_b64: str) -> dict:
         }
 
 
-# --- NEW: Serve the HTML file on the root route ---
 @app.get("/")
 async def get_client():
-    # Assuming 'client.html' exists for testing purposes
     return FileResponse("client.html")
 
 
@@ -186,23 +187,124 @@ async def query_ollama(image_b64: str, prompt: str) -> str:
             return f"Error: {e}"
 
 
-# --- FIXED WEBSOCKET ENDPOINT ---
+async def process_single_frame(websocket: WebSocket, image_data: str, message: dict):
+    """Process a single frame immediately (for button presses or voice commands)"""
+    user_prompt = message.get("prompt")
+    recognize_faces = message.get("recognize_faces", False)
+    
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚡ IMMEDIATE Processing (Face Recognition: {recognize_faces})...")
+    
+    # Determine the final prompt
+    final_prompt = "Describe what you see in this frame. What's happening?"
+    
+    # Handle geofence exit detection
+    geofence_prompt = "The user has left their home geofence. Check if there are any potential dangers in the current frame."
+    
+    if user_prompt == geofence_prompt:
+        print("🚨 Geofence exit detected. Running security analysis.")
+        final_prompt = user_prompt 
+    elif user_prompt:
+        print(f"🎤 User prompt: {user_prompt}")
+        final_prompt = user_prompt
+    else:
+        print(f"🖼️ Running descriptive analysis")
+
+    # Run face recognition if requested
+    face_results = None
+    if recognize_faces:
+        face_results = recognize_faces_in_frame(image_data)
+        
+        print(f"--- Face Recognition Result (Count: {face_results['count']}) ---")
+        if face_results and face_results["count"] > 0:
+            for face in face_results["faces"]:
+                print(f"  - Detected: {face['name']} (Conf: {face['confidence']:.2f})")
+            
+            # Enhance prompt with face recognition context
+            detected_names = [f["name"] for f in face_results["faces"]]
+            if any(name != "Unknown" for name in detected_names):
+                final_prompt += f"\n\nNote: I've detected the following people in frame: {', '.join(detected_names)}. Include this information naturally in your description."
+
+    # ALWAYS run LLM analysis for detailed descriptions
+    analysis = await query_ollama(image_data, final_prompt)
+    analysis = analysis.strip()
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Analysis: {analysis}")
+
+    # Send result back to client
+    response_data = {
+        "response": analysis,
+        "faces": face_results
+    }
+
+    try:
+        await websocket.send_json(response_data)
+    except:
+        print("Failed to send response to client")
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("Client connected")
 
-    DEFAULT_DOOR_PROMPT = "Analyze this frame according to the system instructions."
+    DEFAULT_PROMPT = "Describe what you see in this frame. What's happening?"
+    
+    last_process_time = 0
+    latest_frame = None
+    latest_message = None
+    processing_lock = asyncio.Lock()
+    is_processing = False
+
+    async def process_frame_periodically():
+        """Background task that processes frames every FRAME_PROCESS_INTERVAL seconds"""
+        nonlocal last_process_time, latest_frame, latest_message, is_processing
+        
+        # Initialize last_process_time to allow immediate first processing
+        last_process_time = time.time() - FRAME_PROCESS_INTERVAL
+        
+        while True:
+            try:
+                await asyncio.sleep(0.1)  # Check frequently
+                
+                current_time = time.time()
+                if (latest_frame is not None and 
+                    current_time - last_process_time >= FRAME_PROCESS_INTERVAL and
+                    not is_processing):
+                    
+                    async with processing_lock:
+                        if latest_frame is None:
+                            continue
+                            
+                        # Process the latest frame
+                        image_data = latest_frame
+                        message = latest_message or {}
+                        
+                        # Only process background frames if they don't have face recognition enabled
+                        # (immediate face recognition requests are handled separately)
+                        recognize_faces = message.get("recognize_faces", False)
+                        
+                        if not recognize_faces:
+                            is_processing = True
+                            await process_single_frame(websocket, image_data, message)
+                            is_processing = False
+                        
+                        last_process_time = current_time
+                        
+            except Exception as e:
+                print(f"Error in periodic processing: {e}")
+                is_processing = False
+                break
+
+    # Start background processing task
+    process_task = asyncio.create_task(process_frame_periodically())
 
     try:
         while True:
-            # 1. Receive data from client
+            # Receive data from client
             data = await websocket.receive_text()
 
             try:
                 message = json.loads(data)
                 image_data = message.get("image")
-                user_prompt = message.get("prompt") 
                 recognize_faces = message.get("recognize_faces", False)
 
                 if not image_data:
@@ -212,72 +314,24 @@ async def websocket_endpoint(websocket: WebSocket):
                 if "," in image_data:
                     image_data = image_data.split(",")[1]
 
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Processing frame...")
+                # Store the latest frame and message for background processing
+                async with processing_lock:
+                    latest_frame = image_data
+                    latest_message = message
 
-                # --- FIX: Determine the final prompt and if LLM analysis is required ---
-                final_prompt = None 
-                ollama_required = True
-
-                # 1. Handle specific requests (Geofence, Spoken Command)
-                geofence_prompt = "The user has left their home geofence. Check if there are any potential dangers in the current frame."
-                
-                if user_prompt == geofence_prompt:
-                    print("🚨 Geofence exit detected. Running security analysis.")
-                    final_prompt = user_prompt 
-
-                elif user_prompt and user_prompt != DEFAULT_DOOR_PROMPT:
-                    print(f"🎤 User prompt received: {user_prompt}")
-                    final_prompt = user_prompt 
-
-                # 2. Handle default requests
-                elif not recognize_faces:
-                    # If it's a default request AND face recognition is NOT forced, run door analysis.
-                    print("🖼️ Running default door analysis (Door Watch).")
-                    final_prompt = DEFAULT_DOOR_PROMPT
-                    
-                # 3. Handle pure face recognition request (No LLM needed)
-                else:
-                    # If recognize_faces is True, but there's no unique prompt, skip Ollama.
-                    print("👤 Face recognition only requested (Skipping LLM).")
-                    ollama_required = False
-                
-                # --- END FIX ---
-
-                # Run face recognition if requested (Always runs if recognize_faces is True)
-                face_results = None
+                # If face recognition is requested, process IMMEDIATELY (don't wait for background task)
                 if recognize_faces:
-                    face_results = recognize_faces_in_frame(image_data)
-                    
-                    # --- DEBUGGING OUTPUT FOR FACE RECOGNITION ---
-                    print(f"--- Face Recognition Result (Count: {face_results['count']}) ---")
-                    if face_results and face_results["count"] > 0:
-                        for face in face_results["faces"]:
-                            print(f"  - Detected: {face['name']} (Conf: {face['confidence']:.2f}, Loc: {face['location']})")
-
-                # Run LLM analysis only if required
-                analysis = None
-                if ollama_required:
-                    tasks = [query_ollama(image_data, final_prompt)]
-                    analysis = await tasks[0]
-                    analysis = analysis.strip()
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Analysis: {analysis}")
-                
-                # Set a default response if we skipped the LLM
-                response_text = analysis if analysis is not None else "clear"
-
-                # 3. Send result back to client
-                response_data = {
-                    "response": response_text,
-                    "faces": face_results
-                }
-
-                await websocket.send_json(response_data)
+                    print("🔥 Face recognition requested - processing immediately!")
+                    is_processing = True
+                    await process_single_frame(websocket, image_data, message)
+                    is_processing = False
 
             except json.JSONDecodeError:
                 await websocket.send_json({"error": "Invalid JSON format"})
 
     except WebSocketDisconnect:
         print("Client disconnected")
+        process_task.cancel()
 
 
 @app.on_event("startup")
@@ -291,4 +345,5 @@ if __name__ == "__main__":
     print(f"Starting server on http://{HOST}:{PORT}")
     print(f"Place known face images in '{KNOWN_FACES_DIR}/' directory")
     print("Name files as 'PersonName.jpg' (e.g., 'JohnDoe.jpg')")
+    print(f"Frame processing interval: {FRAME_PROCESS_INTERVAL} seconds")
     uvicorn.run(app, host=HOST, port=PORT)
