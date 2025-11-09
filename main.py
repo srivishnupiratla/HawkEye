@@ -194,21 +194,6 @@ async def process_single_frame(websocket: WebSocket, image_data: str, message: d
     
     print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚡ IMMEDIATE Processing (Face Recognition: {recognize_faces})...")
     
-    # Determine the final prompt
-    final_prompt = "Describe what you see in this frame. What's happening?"
-    
-    # Handle geofence exit detection
-    geofence_prompt = "The user has left their home geofence. Check if there are any potential dangers in the current frame."
-    
-    if user_prompt == geofence_prompt:
-        print("🚨 Geofence exit detected. Running security analysis.")
-        final_prompt = user_prompt 
-    elif user_prompt:
-        print(f"🎤 User prompt: {user_prompt}")
-        final_prompt = user_prompt
-    else:
-        print(f"🖼️ Running descriptive analysis")
-
     # Run face recognition if requested
     face_results = None
     if recognize_faces:
@@ -218,16 +203,42 @@ async def process_single_frame(websocket: WebSocket, image_data: str, message: d
         if face_results and face_results["count"] > 0:
             for face in face_results["faces"]:
                 print(f"  - Detected: {face['name']} (Conf: {face['confidence']:.2f})")
-            
-            # Enhance prompt with face recognition context
+    
+    # Determine if we need LLM analysis
+    needs_llm = False
+    final_prompt = "Describe what you see in this frame. What's happening?"
+    
+    # Handle geofence exit detection
+    geofence_prompt = "The user has left their home geofence. Check if there are any potential dangers in the current frame."
+    
+    if user_prompt == geofence_prompt:
+        print("🚨 Geofence exit detected. Running security analysis.")
+        final_prompt = user_prompt
+        needs_llm = True
+    elif user_prompt and user_prompt != "Analyze this frame according to the system instructions.":
+        print(f"🎤 User prompt: {user_prompt}")
+        final_prompt = user_prompt
+        needs_llm = True
+    elif not recognize_faces:
+        # Only run LLM if this is a background descriptive frame (no face recognition)
+        print(f"🖼️ Running descriptive analysis")
+        needs_llm = True
+    else:
+        # Face recognition only - skip LLM for speed
+        print(f"👤 Face recognition only - skipping LLM for speed")
+    
+    # Run LLM analysis only if needed
+    analysis = "clear"
+    if needs_llm:
+        # Enhance prompt with face recognition context if faces were found
+        if face_results and face_results["count"] > 0:
             detected_names = [f["name"] for f in face_results["faces"]]
             if any(name != "Unknown" for name in detected_names):
                 final_prompt += f"\n\nNote: I've detected the following people in frame: {', '.join(detected_names)}. Include this information naturally in your description."
-
-    # ALWAYS run LLM analysis for detailed descriptions
-    analysis = await query_ollama(image_data, final_prompt)
-    analysis = analysis.strip()
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Analysis: {analysis}")
+        
+        analysis = await query_ollama(image_data, final_prompt)
+        analysis = analysis.strip()
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Analysis: {analysis}")
 
     # Send result back to client
     response_data = {
