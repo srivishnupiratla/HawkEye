@@ -204,6 +204,7 @@ def query():
             "answer": answer,
         }
         print(answer)
+        return answer
     else:
         return "Not available.", 400
 
