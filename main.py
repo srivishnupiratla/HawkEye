@@ -167,11 +167,12 @@ async def handle_speech_prompt(prompt_text: str, image_b64: str = None) -> dict:
                     SPEECH_API_URL,
                     params={"text": prompt_text}
                 )
-                response.raise_for_status()
-                
+                response.raise_for_status()               
+                print(response.content)
+
                 return {
                     "type": "speech_api",
-                    "api_response": response.json(),
+                    "api_response": {"response": response.text.strip()},
                     "status_code": response.status_code
                 }
             except httpx.RequestError as e:
