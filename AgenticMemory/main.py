@@ -24,7 +24,7 @@ def find_object_category(object, category):
 def init_object_schema(object, image = '') -> str:
     result = find_object_category(object, "schema")
     if result:
-        return ''
+        return result
 
     response: ChatResponse = chat(
         model="gemma3:4b",
