@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ollama VLM Stream</title>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background: #f4f4f9; }
+        #video-container { position: relative; display: inline-block; }
+        video { border: 2px solid #333; border-radius: 8px; background: #000; }
+        #status { margin-top: 10px; padding: 10px; border-radius: 4px; }
+        .connected { background-color: #d4edda; color: #155724; }
+        .disconnected { background-color: #f8d7da; color: #721c24; }
+        #log { margin-top: 20px; height: 300px; overflow-y: auto; background: #fff; border: 1px solid #ddd; padding: 10px; border-radius: 4px; }
+        .log-entry { margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #eee; }
+        .timestamp { color: #888; font-size: 0.8em; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; margin-right: 10px; }
+        .control-group { margin: 20px 0; }
+        input[type="text"] { padding: 10px; width: 300px; font-size: 16px; margin-right: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Ollama VLM Real-time Analysis</h1>
+    
+    <div class="control-group">
+        <label for="serverUrl">Server URL:</label>
+        <input type="text" id="serverUrl" value="https://unappealingly-softhearted-declan.ngrok-free.dev" placeholder="e.g., localhost:8000 or your-ngrok-id.ngrok-free.app">
+    </div>
+
+    <div id="video-container">
+        <video id="webcam" width="640" height="480" autoplay playsinline></video>
+    </div>
+
+    <div class="control-group">
+        <button id="startBtn" onclick="startStreaming()">Start Streaming</button>
+        <button id="stopBtn" onclick="stopStreaming()" disabled>Stop Streaming</button>
+    </div>
+
+    <div id="status" class="disconnected">Status: Disconnected</div>
+
+    <h3>Analysis Log:</h3>
+    <div id="log"></div>
+
+    <!-- Hidden canvas for frame capture -->
+    <canvas id="captureCanvas" width="640" height="480" style="display:none;"></canvas>
+
+    <script>
+        const VIDEO_WIDTH = 640;
+        const VIDEO_HEIGHT = 480;
+        const FRAME_INTERVAL_MS = 5000; // Send a frame every 5 seconds
+
+        let ws = null;
+        let streamInterval = null;
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('captureCanvas');
+        const ctx = canvas.getContext('2d');
+        const statusDiv = document.getElementById('status');
+        const logDiv = document.getElementById('log');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const serverUrlInput = document.getElementById('serverUrl');
+
+        // Initialize Webcam
+        async function initCamera() {
+            try {
+                // Use facingMode: 'environment' to prefer back camera on phones
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        width: { ideal: VIDEO_WIDTH }, 
+                        height: { ideal: VIDEO_HEIGHT },
+                        facingMode: 'environment' 
+                    } 
+                });
+                video.srcObject = stream;
+            } catch (err) {
+                alert("Could not access webcam: " + err);
+                addLog("Error", "Camera access denied: " + err.message);
+            }
+        }
+
+        function startStreaming() {
+            let url = serverUrlInput.value.trim();
+            
+            // Simple heuristic to determine if we need ws:// or wss://
+            // ngrok URLs usually don't have the protocol typed in by the user
+            let protocol = (window.location.protocol === 'https:' || url.includes('ngrok')) ? 'wss://' : 'ws://';
+            
+            // Remove any existing protocol if the user pasted it in
+            url = url.replace('http://', '').replace('https://', '').replace('ws://', '').replace('wss://', '');
+            
+            const wsUrl = `${protocol}${url}/ws`;
+            addLog("System", `Connecting to ${wsUrl}...`);
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                updateStatus(true);
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                // Start sending frames periodically
+                streamInterval = setInterval(captureAndSendFrame, FRAME_INTERVAL_MS);
+                addLog("System", "Connected! Starting stream...");
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.error) {
+                    addLog("Error", data.error);
+                } else if (data.response) {
+                    addLog("VLM", data.response);
+                }
+            };
+
+            ws.onclose = (event) => {
+                stopStreaming();
+                addLog("System", `Disconnected (Code: ${event.code})`);
+            };
+
+            ws.onerror = (err) => {
+                console.error("WebSocket error:", err);
+                // Don't rely just on onerror, onclose will typically fire too
+            };
+        }
+
+        function stopStreaming() {
+            if (streamInterval) clearInterval(streamInterval);
+            if (ws) {
+                // Prevent firing onclose again if we are manually closing
+                ws.onclose = () => {}; 
+                ws.close();
+            }
+            ws = null;
+            updateStatus(false);
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+        }
+
+        function captureAndSendFrame() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                // Draw current video frame to canvas
+                ctx.drawImage(video, 0, 0, VIDEO_WIDTH, VIDEO_HEIGHT);
+                // Convert to base64 jpeg (quality 0.7 to reduce bandwidth)
+                const base64Image = canvas.toDataURL('image/jpeg', 0.7);
+                
+                ws.send(JSON.stringify({
+                    image: base64Image,
+                    prompt: "Describe what is happening in this image very briefly."
+                }));
+                addLog("System", "Sent frame for analysis...");
+            }
+        }
+
+        function updateStatus(isConnected) {
+            statusDiv.textContent = isConnected ? "Status: Connected" : "Status: Disconnected";
+            statusDiv.className = isConnected ? "connected" : "disconnected";
+        }
+
+        function addLog(source, message) {
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            const time = new Date().toLocaleTimeString();
+            entry.innerHTML = `<span class="timestamp">[${time}]</span> <strong>${source}:</strong> ${message}`;
+            logDiv.prepend(entry);
+        }
+
+        // Start camera on load
+        initCamera();
+    </script>
+</body>
+</html>
