@@ -16,14 +16,17 @@ import time
 
 # --- Configuration ---
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "llama3.2"
+MODEL_NAME = "llama3.2-vision:11b"
 HOST = "0.0.0.0"
 PORT = 8000
-KNOWN_FACES_DIR = "known_faces"  # Directory to store known face images
-FRAME_PROCESS_INTERVAL = 2.0  # Process frame every 2 seconds
+KNOWN_FACES_DIR = "known_faces"
+FRAME_PROCESS_INTERVAL = 2.0
+
+# Trigger Configuration
+TARGET_OBJECTS = ["apple", "cell phone", "weapon", "bottle", "falling"]
+SECONDARY_PROCESS_URL = "http://localhost:9000/deep-inference"
 # ---------------------
 
-# --- UPDATED SYSTEM PROMPT ---
 SYSTEM_PROMPT = """
 You are a detailed video feed analyst named 'MemoryLink'.
 Your job is to carefully observe and describe what you see in the video feed.
@@ -42,7 +45,6 @@ If the user asks a specific question, answer it while still providing context ab
 
 app = FastAPI()
 
-# Allow CORS to make it easier to test with local HTML files
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -55,14 +57,12 @@ app.add_middleware(
 known_face_encodings = []
 known_face_names = []
 
-
 def load_known_faces():
     """Load all known faces from the known_faces directory."""
     global known_face_encodings, known_face_names
-
     if not os.path.exists(KNOWN_FACES_DIR):
         os.makedirs(KNOWN_FACES_DIR)
-        print(f"Created {KNOWN_FACES_DIR} directory. Add images named as 'PersonName.jpg'")
+        print(f"Created {KNOWN_FACES_DIR} directory.")
         return
 
     known_face_encodings = []
@@ -74,287 +74,179 @@ def load_known_faces():
             try:
                 image = face_recognition.load_image_file(filepath)
                 encodings = face_recognition.face_encodings(image)
-
                 if encodings:
                     known_face_encodings.append(encodings[0])
-                    # Use filename without extension as the person's name
                     name = os.path.splitext(filename)[0]
                     known_face_names.append(name)
                     print(f"Loaded face for: {name}")
-                else:
-                    print(f"No face found in {filename}")
             except Exception as e:
                 print(f"Error loading {filename}: {e}")
-
     print(f"Loaded {len(known_face_names)} known faces")
 
-
 def recognize_faces_in_frame(image_b64: str) -> dict:
-    """
-    Recognize faces in a base64-encoded image.
-    """
+    """Recognize faces in a base64-encoded image."""
     try:
-        # Decode base64 image
         image_bytes = base64.b64decode(image_b64)
-        image = Image.open(io.BytesIO(image_bytes))
-
-        # Convert PIL Image to numpy array
-        image_np = np.array(image)
-
-        # Find all face locations (DETECTION STEP)
+        image_np = np.array(Image.open(io.BytesIO(image_bytes)))
         face_locations = face_recognition.face_locations(image_np)
-        
-        if not face_locations:
-            print("DEBUG: Face Detector FAILED. No face found in image.")
-
-        # Find all face encodings (ENCODING STEP)
         face_encodings = face_recognition.face_encodings(image_np, face_locations)
 
         faces_found = []
-        image = Image.open(io.BytesIO(image_bytes))
-        print("DEBUG:", image.mode, image.size)
-        image.save("debug_frame.jpg")
-        
         for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-            # See if the face matches any known faces
             matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.6)
             name = "Unknown"
-            confidence_distance = 1.0 
-
-            # Use the known face with the smallest distance to the new face
+            confidence = 0.0
             if known_face_encodings:
                 face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
                 best_match_index = np.argmin(face_distances)
-                
-                confidence_distance = face_distances[best_match_index]
-                
-                print(f"DEBUG: Found face. Closest Known Face: {known_face_names[best_match_index]} | Distance Score: {confidence_distance:.2f}")
-                
                 if matches[best_match_index]:
                     name = known_face_names[best_match_index]
-
-            confidence_score = float(1.0 - confidence_distance)
-            
-            if not known_face_encodings:
-                confidence_score = 0.0
+                    confidence = 1.0 - face_distances[best_match_index]
 
             faces_found.append({
                 "name": name,
                 "location": {"top": top, "right": right, "bottom": bottom, "left": left},
-                "confidence": confidence_score
+                "confidence": float(confidence)
             })
-
-        return {
-            "count": len(faces_found),
-            "faces": faces_found
-        }
-
+        return {"count": len(faces_found), "faces": faces_found}
     except Exception as e:
         print(f"Face recognition error: {e}")
-        return {
-            "count": 0,
-            "faces": [],
-            "error": str(e)
-        }
+        return {"count": 0, "faces": [], "error": str(e)}
 
+# --- [UPDATED] Forwarder Helper ---
+async def forward_frame(image_b64: str, detected_object: str):
+    """Sends a SINGLE detected object frame to secondary process."""
+    print(f"--> FORWARDING single trigger: '{detected_object}'...")
+    
+    # Requested JSON format
+    payload = {
+        "object": detected_object,
+        "image": image_b64
+    }
+    
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        try:
+             # Uncomment to actually send to your real service
+             response = await client.post(SECONDARY_PROCESS_URL, json=payload)
+             print(f"    > Secondary responded for '{detected_object}': {response.status_code}")
+        except httpx.RequestError:
+            print(f"    > Forwarding failed for '{detected_object}' (secondary likely offline)")
+
+async def query_ollama(image_b64: str, prompt: str) -> str:
+    """Sends the image and prompt to Ollama and returns the textual response."""
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            response = await client.post(
+                OLLAMA_URL,
+                json={
+                    "model": MODEL_NAME, "prompt": prompt, "system": SYSTEM_PROMPT,
+                    "images": [image_b64], "stream": False
+                }
+            )
+            response.raise_for_status()
+            return response.json().get("response", "No response form model.")
+        except Exception as e:
+            print(f"Ollama error: {e}")
+            return f"Error: {e}"
+
+async def process_single_frame(websocket: WebSocket, image_data: str, message: dict):
+    user_prompt = message.get("prompt")
+    recognize_faces = message.get("recognize_faces", False)
+
+    # 1. Face Recognition
+    face_results = None
+    if recognize_faces:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Running Face ID...")
+        face_results = recognize_faces_in_frame(image_data)
+
+    # 2. Determine Prompt
+    final_prompt = "Describe what you see in this frame. What's happening?"
+    if user_prompt and user_prompt != "Analyze this frame according to the system instructions.":
+        print(f"🎤 User prompt: {user_prompt}")
+        final_prompt = user_prompt
+
+    # 3. Add Face Context
+    if face_results and face_results["count"] > 0:
+         detected_names = [f["name"] for f in face_results["faces"] if f["name"] != "Unknown"]
+         if detected_names:
+             final_prompt += f"\n\nNote: I've detected: {', '.join(detected_names)}."
+
+    # 4. Full VLM Analysis
+    print(f"🔍 Running full analysis...")
+    analysis = await query_ollama(image_data, final_prompt)
+    analysis_clean = analysis.strip()
+    print(f"📝 Analysis: {analysis_clean[:100]}...")
+
+    # 5. [UPDATED] Word Search Trigger Loop
+    analysis_lower = analysis_clean.lower()
+    # Finds ALL matches in the text
+    triggers = [obj for obj in TARGET_OBJECTS if obj.lower() in analysis_lower]
+
+    if triggers:
+        print(f"🚨 TRIGGER MATCHES: {triggers}")
+        # Loop through every match and fire off a separate request for each
+        for trigger in triggers:
+             asyncio.create_task(forward_frame(image_data, trigger))
+
+    # 6. Send Response to Client
+    try:
+        await websocket.send_json({
+            "response": analysis_clean,
+            "faces": face_results,
+            "triggers": triggers
+        })
+    except:
+        print("Failed to send response to client")
 
 @app.get("/")
 async def get_client():
     return FileResponse("client.html")
 
-
-async def query_ollama(image_b64: str, prompt: str) -> str:
-    """Sends the image and prompt to Ollama and returns the textual response."""
-    async with httpx.AsyncClient(timeout=None) as client:
-        try:
-            response = await client.post(
-                OLLAMA_URL,
-                json={
-                    "model": MODEL_NAME,
-                    "prompt": prompt,
-                    "system": SYSTEM_PROMPT,
-                    "images": [image_b64],
-                    "stream": False
-                }
-            )
-            response.raise_for_status()
-            return response.json().get("response", "No response from model.")
-        except httpx.RequestError as e:
-            print(f"Ollama connection error: {e}")
-            return f"Error communicating with Ollama: {e}"
-        except Exception as e:
-            print(f"An error occurred: {e}")
-            return f"Error: {e}"
-
-
-async def process_single_frame(websocket: WebSocket, image_data: str, message: dict):
-    """Process a single frame immediately (for button presses or voice commands)"""
-    user_prompt = message.get("prompt")
-    recognize_faces = message.get("recognize_faces", False)
-    
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚡ IMMEDIATE Processing (Face Recognition: {recognize_faces})...")
-    
-    # Run face recognition if requested
-    face_results = None
-    if recognize_faces:
-        face_results = recognize_faces_in_frame(image_data)
-        
-        print(f"--- Face Recognition Result (Count: {face_results['count']}) ---")
-        if face_results and face_results["count"] > 0:
-            for face in face_results["faces"]:
-                print(f"  - Detected: {face['name']} (Conf: {face['confidence']:.2f})")
-    
-    # Determine if we need LLM analysis
-    needs_llm = False
-    final_prompt = "Describe what you see in this frame. What's happening?"
-    
-    # Handle geofence exit detection
-    geofence_prompt = "The user has left their home geofence. Check if there are any potential dangers in the current frame."
-    
-    if user_prompt == geofence_prompt:
-        print("🚨 Geofence exit detected. Running security analysis.")
-        final_prompt = user_prompt
-        needs_llm = True
-    elif user_prompt and user_prompt != "Analyze this frame according to the system instructions.":
-        print(f"🎤 User prompt: {user_prompt}")
-        final_prompt = user_prompt
-        needs_llm = True
-    elif not recognize_faces:
-        # Only run LLM if this is a background descriptive frame (no face recognition)
-        print(f"🖼️ Running descriptive analysis")
-        needs_llm = True
-    else:
-        # Face recognition only - skip LLM for speed
-        print(f"👤 Face recognition only - skipping LLM for speed")
-    
-    # Run LLM analysis only if needed
-    analysis = "clear"
-    if needs_llm:
-        # Enhance prompt with face recognition context if faces were found
-        if face_results and face_results["count"] > 0:
-            detected_names = [f["name"] for f in face_results["faces"]]
-            if any(name != "Unknown" for name in detected_names):
-                final_prompt += f"\n\nNote: I've detected the following people in frame: {', '.join(detected_names)}. Include this information naturally in your description."
-        
-        analysis = await query_ollama(image_data, final_prompt)
-        analysis = analysis.strip()
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Analysis: {analysis}")
-
-    # Send result back to client
-    response_data = {
-        "response": analysis,
-        "faces": face_results
-    }
-
-    try:
-        await websocket.send_json(response_data)
-    except:
-        print("Failed to send response to client")
-
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("Client connected")
-
-    DEFAULT_PROMPT = "Describe what you see in this frame. What's happening?"
     
     last_process_time = 0
     latest_frame = None
     latest_message = None
     processing_lock = asyncio.Lock()
-    is_processing = False
 
-    async def process_frame_periodically():
-        """Background task that processes frames every FRAME_PROCESS_INTERVAL seconds"""
-        nonlocal last_process_time, latest_frame, latest_message, is_processing
-        
-        # Initialize last_process_time to allow immediate first processing
-        last_process_time = time.time() - FRAME_PROCESS_INTERVAL
-        
+    async def scanner_loop():
+        nonlocal last_process_time, latest_frame, latest_message
         while True:
-            try:
-                await asyncio.sleep(0.1)  # Check frequently
-                
-                current_time = time.time()
-                if (latest_frame is not None and 
-                    current_time - last_process_time >= FRAME_PROCESS_INTERVAL and
-                    not is_processing):
-                    
+            await asyncio.sleep(0.1)
+            if latest_frame and (time.time() - last_process_time >= FRAME_PROCESS_INTERVAL):
+                if not processing_lock.locked():
                     async with processing_lock:
-                        if latest_frame is None:
-                            continue
-                            
-                        # Process the latest frame
-                        image_data = latest_frame
-                        message = latest_message or {}
-                        
-                        # Only process background frames if they don't have face recognition enabled
-                        # (immediate face recognition requests are handled separately)
-                        recognize_faces = message.get("recognize_faces", False)
-                        
-                        if not recognize_faces:
-                            is_processing = True
-                            await process_single_frame(websocket, image_data, message)
-                            is_processing = False
-                        
-                        last_process_time = current_time
-                        
-            except Exception as e:
-                print(f"Error in periodic processing: {e}")
-                is_processing = False
-                break
+                        is_idle = not latest_message.get("prompt") or \
+                                  latest_message.get("prompt") == "Analyze this frame according to the system instructions."
+                        if is_idle:
+                            await process_single_frame(websocket, latest_frame, latest_message or {})
+                            last_process_time = time.time()
 
-    # Start background processing task
-    process_task = asyncio.create_task(process_frame_periodically())
+    scanner_task = asyncio.create_task(scanner_loop())
 
     try:
         while True:
-            # Receive data from client
             data = await websocket.receive_text()
-
-            try:
-                message = json.loads(data)
-                image_data = message.get("image")
-                recognize_faces = message.get("recognize_faces", False)
-
-                if not image_data:
-                    await websocket.send_json({"error": "No image data received"})
-                    continue
-
-                if "," in image_data:
-                    image_data = image_data.split(",")[1]
-
-                # Store the latest frame and message for background processing
-                async with processing_lock:
-                    latest_frame = image_data
-                    latest_message = message
-
-                # If face recognition is requested, process IMMEDIATELY (don't wait for background task)
-                if recognize_faces:
-                    print("🔥 Face recognition requested - processing immediately!")
-                    is_processing = True
-                    await process_single_frame(websocket, image_data, message)
-                    is_processing = False
-
-            except json.JSONDecodeError:
-                await websocket.send_json({"error": "Invalid JSON format"})
+            msg = json.loads(data)
+            if msg.get("image"):
+                latest_frame = msg["image"].split(",")[1] if "," in msg["image"] else msg["image"]
+                latest_message = msg
+                
+                if msg.get("recognize_faces") or (msg.get("prompt") and msg["prompt"] != "Analyze this frame according to the system instructions."):
+                     async with processing_lock:
+                         await process_single_frame(websocket, latest_frame, msg)
+                         last_process_time = time.time()
 
     except WebSocketDisconnect:
         print("Client disconnected")
-        process_task.cancel()
-
+        scanner_task.cancel()
 
 @app.on_event("startup")
-async def startup_event():
-    """Load known faces when the server starts."""
-    print("Loading known faces...")
+async def startup():
     load_known_faces()
 
-
 if __name__ == "__main__":
-    print(f"Starting server on http://{HOST}:{PORT}")
-    print(f"Place known face images in '{KNOWN_FACES_DIR}/' directory")
-    print("Name files as 'PersonName.jpg' (e.g., 'JohnDoe.jpg')")
-    print(f"Frame processing interval: {FRAME_PROCESS_INTERVAL} seconds")
     uvicorn.run(app, host=HOST, port=PORT)
