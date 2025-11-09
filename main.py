@@ -16,18 +16,32 @@ import time
 
 # --- Configuration ---
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "llama3.2-vision"
+MODEL_NAME = "llama3.2-vision:11b"
 HOST = "0.0.0.0"
 PORT = 8000
 KNOWN_FACES_DIR = "known_faces"
 FRAME_PROCESS_INTERVAL = 2.0
 
-# [NEW] Detection Configuration
-# The set of objects we strictly watch for
-TARGET_OBJECTS = ["apples"]
-# The URL of the "other process" that will do deeper inference
+# Trigger Configuration
+TARGET_OBJECTS = ["apple", "cell phone", "weapon", "bottle", "falling"]
 SECONDARY_PROCESS_URL = "http://localhost:9000/deep-inference"
 # ---------------------
+
+SYSTEM_PROMPT = """
+You are a detailed video feed analyst named 'MemoryLink'.
+Your job is to carefully observe and describe what you see in the video feed.
+
+ALWAYS provide a detailed description that includes:
+- What objects, people, or scenes are visible
+- Any actions or movements you can detect
+- The setting or environment
+- Any notable details or changes
+
+Be conversational and descriptive, as if you're explaining what you see to someone who can't see the screen.
+Keep responses concise but informative (2-4 sentences typically).
+
+If the user asks a specific question, answer it while still providing context about what you see.
+"""
 
 app = FastAPI()
 
@@ -70,7 +84,7 @@ def load_known_faces():
     print(f"Loaded {len(known_face_names)} known faces")
 
 def recognize_faces_in_frame(image_b64: str) -> dict:
-    """Recognize faces using standard CV library (not VLM)."""
+    """Recognize faces in a base64-encoded image."""
     try:
         image_bytes = base64.b64decode(image_b64)
         image_np = np.array(Image.open(io.BytesIO(image_bytes)))
@@ -94,127 +108,99 @@ def recognize_faces_in_frame(image_b64: str) -> dict:
                 "location": {"top": top, "right": right, "bottom": bottom, "left": left},
                 "confidence": float(confidence)
             })
-
         return {"count": len(faces_found), "faces": faces_found}
     except Exception as e:
         print(f"Face recognition error: {e}")
         return {"count": 0, "faces": [], "error": str(e)}
 
-# --- [UPDATED] Simpler VLM Object Detector ---
-async def detect_objects(image_b64: str) -> list:
-    """
-    Asks for a general description and checks if target words are in it.
-    More robust than strict JSON schema for small models.
-    """
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            response = await client.post(
-                OLLAMA_URL,
-                json={
-                    "model": MODEL_NAME,
-                    # Very open-ended prompt to get maximum recall
-                    "prompt": "List everything you can see in this image. Be detailed.",
-                    "images": [image_b64],
-                    "stream": False,
-                    "options": {"temperature": 0.0} 
-                }
-            )
-            if response.status_code == 200:
-                full_text = response.json().get("response", "").lower()
-                print(f"Raw VLM Output: {full_text}") # ADDED PRINT STATEMENT
-                # Simple string matching
-                detected = [obj for obj in TARGET_OBJECTS if obj.lower() in full_text]
-                return detected
-        except Exception as e:
-            print(f"Detection error: {e}")
-    return []
-
-# --- Forwarder to Secondary Process ---
-async def forward_frame(image_b64: str, detected_items: list, metadata: dict = None):
-    """
-    Sends the frame to another service for deeper analysis.
-    This is 'fire-and-forget' - we don't wait long for a response.
-    """
-    print(f"--> FORWARDING frame with {detected_items} to secondary process...")
+# --- [UPDATED] Forwarder Helper ---
+async def forward_frame(image_b64: str, detected_object: str):
+    """Sends a SINGLE detected object frame to secondary process."""
+    print(f"--> FORWARDING single trigger: '{detected_object}'...")
+    
+    # Requested JSON format
     payload = {
-        "timestamp": datetime.now().isoformat(),
-        "triggers": detected_items,
-        "image": image_b64,
-        "metadata": metadata or {}
+        "object": detected_object,
+        "image": image_b64
     }
-    # Using a short timeout so we don't hang the main scanner if secondary is down
-    async with httpx.AsyncClient(timeout=1.0) as client:
+    
+    async with httpx.AsyncClient(timeout=2.0) as client:
         try:
+             # Uncomment to actually send to your real service
              response = await client.post(SECONDARY_PROCESS_URL, json=payload)
-             print(f"    > Secondary process responded: {response.status_code}")
-        except httpx.RequestError as e:
-            print(f"Warning: Could not forward frame to secondary: {e}")
+             print(f"    > Secondary responded for '{detected_object}': {response.status_code}")
+        except httpx.RequestError:
+            print(f"    > Forwarding failed for '{detected_object}' (secondary likely offline)")
 
-async def query_ollama_full(image_b64: str, prompt: str, system_prompt: str) -> str:
-    """Standard full VLM analysis for user queries."""
-    async with httpx.AsyncClient(timeout=None) as client:
+async def query_ollama(image_b64: str, prompt: str) -> str:
+    """Sends the image and prompt to Ollama and returns the textual response."""
+    async with httpx.AsyncClient(timeout=60.0) as client:
         try:
             response = await client.post(
                 OLLAMA_URL,
                 json={
-                    "model": MODEL_NAME, "prompt": prompt, "system": system_prompt,
+                    "model": MODEL_NAME, "prompt": prompt, "system": SYSTEM_PROMPT,
                     "images": [image_b64], "stream": False
                 }
             )
-            return response.json().get("response", "No response.")
+            response.raise_for_status()
+            return response.json().get("response", "No response form model.")
         except Exception as e:
+            print(f"Ollama error: {e}")
             return f"Error: {e}"
-
-@app.get("/")
-async def get_client():
-    return FileResponse("client.html")
 
 async def process_single_frame(websocket: WebSocket, image_data: str, message: dict):
     user_prompt = message.get("prompt")
     recognize_faces = message.get("recognize_faces", False)
 
-    # 1. Always run Face ID if requested (it's fast and local)
+    # 1. Face Recognition
     face_results = None
     if recognize_faces:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Running Face ID...")
         face_results = recognize_faces_in_frame(image_data)
-        if face_results["count"] > 0:
-             print(f"   > Faces found: {[f['name'] for f in face_results['faces']]}")
 
-    response_text = ""
-
-    # 2. DECISION LOGIC
+    # 2. Determine Prompt
+    final_prompt = "Describe what you see in this frame. What's happening?"
     if user_prompt and user_prompt != "Analyze this frame according to the system instructions.":
-        # CASE A: User asked a specific question (override scanner)
-        print(f"🎤 User Query: {user_prompt}")
-        response_text = await query_ollama_full(image_data, user_prompt, "You are a helpful visual assistant.")
+        print(f"🎤 User prompt: {user_prompt}")
+        final_prompt = user_prompt
 
-    else:
-        # CASE B: Background Scanning Mode (Default)
-        # Step 1: Scan strictly for target objects
-        print(f"🔍 Scanning for targets: {TARGET_OBJECTS}...")
-        detected = await detect_objects(image_data)
+    # 3. Add Face Context
+    if face_results and face_results["count"] > 0:
+         detected_names = [f["name"] for f in face_results["faces"] if f["name"] != "Unknown"]
+         if detected_names:
+             final_prompt += f"\n\nNote: I've detected: {', '.join(detected_names)}."
 
-        if detected:
-            # TRIGGER!
-            print(f"🚨 MATCH FOUND: {detected}")
-            response_text = f"ALERT: Detected {', '.join(detected)}"
-            
-            # Step 2: Forward to secondary process (non-blocking to main loop usually)
-            asyncio.create_task(forward_frame(image_data, detected, metadata={"faces": face_results}))
-        else:
-            print("   > Scan clear.")
-            response_text = "Scan clear. Monitoring..."
+    # 4. Full VLM Analysis
+    print(f"🔍 Running full analysis...")
+    analysis = await query_ollama(image_data, final_prompt)
+    analysis_clean = analysis.strip()
+    print(f"📝 Analysis: {analysis_clean[:100]}...")
 
-    # Send feedback to client
+    # 5. [UPDATED] Word Search Trigger Loop
+    analysis_lower = analysis_clean.lower()
+    # Finds ALL matches in the text
+    triggers = [obj for obj in TARGET_OBJECTS if obj.lower() in analysis_lower]
+
+    if triggers:
+        print(f"🚨 TRIGGER MATCHES: {triggers}")
+        # Loop through every match and fire off a separate request for each
+        for trigger in triggers:
+             asyncio.create_task(forward_frame(image_data, trigger))
+
+    # 6. Send Response to Client
     try:
         await websocket.send_json({
-            "response": response_text,
+            "response": analysis_clean,
             "faces": face_results,
-            "triggers": detected if 'detected' in locals() else []
+            "triggers": triggers
         })
-    except Exception as e:
-        print(f"Client send error: {e}")
+    except:
+        print("Failed to send response to client")
+
+@app.get("/")
+async def get_client():
+    return FileResponse("client.html")
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -226,7 +212,6 @@ async def websocket_endpoint(websocket: WebSocket):
     latest_message = None
     processing_lock = asyncio.Lock()
 
-    # Background scanner loop
     async def scanner_loop():
         nonlocal last_process_time, latest_frame, latest_message
         while True:
@@ -234,10 +219,8 @@ async def websocket_endpoint(websocket: WebSocket):
             if latest_frame and (time.time() - last_process_time >= FRAME_PROCESS_INTERVAL):
                 if not processing_lock.locked():
                     async with processing_lock:
-                        # Only auto-scan if user isn't currently asking a specific question
                         is_idle = not latest_message.get("prompt") or \
                                   latest_message.get("prompt") == "Analyze this frame according to the system instructions."
-                        
                         if is_idle:
                             await process_single_frame(websocket, latest_frame, latest_message or {})
                             last_process_time = time.time()
@@ -251,8 +234,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if msg.get("image"):
                 latest_frame = msg["image"].split(",")[1] if "," in msg["image"] else msg["image"]
                 latest_message = msg
-
-                # If it's an immediate user/face request, bypass scanner timer
+                
                 if msg.get("recognize_faces") or (msg.get("prompt") and msg["prompt"] != "Analyze this frame according to the system instructions."):
                      async with processing_lock:
                          await process_single_frame(websocket, latest_frame, msg)
