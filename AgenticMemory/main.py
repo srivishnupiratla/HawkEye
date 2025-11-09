@@ -197,21 +197,15 @@ def query():
     print("QUERYI: " + user_query)
 
     if user_query:
-        query = search_query(user_query)
+        answer = search_query(user_query)
         response_data = {
             "status": "success",
             "received_query": user_query,
-            "answer": query,
+            "answer": answer,
         }
-        print(query)
-        return jsonify(response_data), 200
+        print(answer)
     else:
-        result_from_query = {
-            "status": "fail",
-            "received_query": user_query,
-            "answer" : "Not available."
-        }
-        return result_from_query, 400
+        return "Not available.", 400
 
 
 if __name__ == '__main__':
