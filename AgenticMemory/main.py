@@ -196,18 +196,20 @@ def query():
     user_query = request.args.get('text')
     print("QUERYI: " + user_query)
 
-
     if user_query:
+        query = search_query(user_query)
         response_data = {
             "status": "success",
             "received_query": user_query,
-            "answer": search_query(user_query),
+            "answer": query,
         }
+        print(query)
         return jsonify(response_data), 200
     else:
         result_from_query = {
             "status": "fail",
-            "received_query": user_query
+            "received_query": user_query,
+            "answer" : "Not available."
         }
         return result_from_query, 400
 
