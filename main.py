@@ -16,7 +16,7 @@ import time
 
 # --- Configuration ---
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "llava"
+MODEL_NAME = "llama3.2"
 HOST = "0.0.0.0"
 PORT = 8000
 KNOWN_FACES_DIR = "known_faces"  # Directory to store known face images
