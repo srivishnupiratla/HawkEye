@@ -16,7 +16,7 @@ import time
 
 # --- Configuration ---
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "llama3.2-vision:11b"
+MODEL_NAME = "gemma3:4b"
 HOST = "0.0.0.0"
 PORT = 8000
 KNOWN_FACES_DIR = "known_faces"
@@ -24,7 +24,10 @@ FRAME_PROCESS_INTERVAL = 2.0
 
 # Trigger Configuration
 TARGET_OBJECTS = ["apple", "cell phone", "weapon", "bottle", "falling"]
-SECONDARY_PROCESS_URL = "http://localhost:9000/deep-inference"
+SECONDARY_PROCESS_URL = "http://localhost:9000/object"
+
+# Speech-to-Text API Configuration
+SPEECH_API_URL = "http://localhost:9000/query"  # Update with your API endpoint
 # ---------------------
 
 SYSTEM_PROMPT = """
@@ -113,12 +116,88 @@ def recognize_faces_in_frame(image_b64: str) -> dict:
         print(f"Face recognition error: {e}")
         return {"count": 0, "faces": [], "error": str(e)}
 
-# --- [UPDATED] Forwarder Helper ---
+# --- [NEW] Speech-to-Text Handler ---
+async def handle_speech_prompt(prompt_text: str, image_b64: str = None) -> dict:
+    """
+    Handles speech-to-text prompts with two behaviors:
+    1. If prompt contains "who is this", trigger facial recognition
+    2. Otherwise, send to speech API endpoint
+    
+    Returns dict with 'type' and relevant data
+    """
+    prompt_lower = prompt_text.lower().strip()
+    
+    # Check if this is a "who is this" query
+    if "who is this" in prompt_lower:
+        print(f"🎤 Speech prompt: '{prompt_text}' -> FACIAL RECOGNITION")
+        
+        if not image_b64:
+            return {
+                "type": "facial_recognition",
+                "error": "No image provided for facial recognition"
+            }
+        
+        face_results = recognize_faces_in_frame(image_b64)
+        
+        # Format response based on results
+        if face_results["count"] > 0:
+            names = [f["name"] for f in face_results["faces"]]
+            recognized = [n for n in names if n != "Unknown"]
+            
+            if recognized:
+                response_text = f"I can see {', '.join(recognized)}."
+            else:
+                response_text = f"I can see {face_results['count']} person(s), but I don't recognize them."
+        else:
+            response_text = "I don't see any faces in the current frame."
+        
+        return {
+            "type": "facial_recognition",
+            "face_results": face_results,
+            "response_text": response_text
+        }
+    
+    else:
+        # Send to speech API endpoint
+        print(f"🎤 Speech prompt: '{prompt_text}' -> SPEECH API")
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                response = await client.get(
+                    SPEECH_API_URL,
+                    params={"text": prompt_text}
+                )
+                response.raise_for_status()
+                
+                return {
+                    "type": "speech_api",
+                    "api_response": response.json(),
+                    "status_code": response.status_code
+                }
+            except httpx.RequestError as e:
+                print(f"⚠️ Speech API request failed: {e}")
+                print(f"    Continuing without speech API response...")
+                return {
+                    "type": "speech_api",
+                    "api_response": {"response": "Speech API is currently unavailable."},
+                    "error": str(e),
+                    "status_code": 0
+                }
+            except Exception as e:
+                print(f"⚠️ Unexpected error calling speech API: {e}")
+                print(f"    Continuing without speech API response...")
+                return {
+                    "type": "speech_api",
+                    "api_response": {"response": "Unable to process speech request."},
+                    "error": str(e),
+                    "status_code": 0
+                }
+
+# --- Forwarder Helper ---
 async def forward_frame(image_b64: str, detected_object: str):
     """Sends a SINGLE detected object frame to secondary process."""
     print(f"--> FORWARDING single trigger: '{detected_object}'...")
     
-    # Requested JSON format
     payload = {
         "object": detected_object,
         "image": image_b64
@@ -126,11 +205,16 @@ async def forward_frame(image_b64: str, detected_object: str):
     
     async with httpx.AsyncClient(timeout=2.0) as client:
         try:
-             # Uncomment to actually send to your real service
-             response = await client.post(SECONDARY_PROCESS_URL, json=payload)
-             print(f"    > Secondary responded for '{detected_object}': {response.status_code}")
-        except httpx.RequestError:
-            print(f"    > Forwarding failed for '{detected_object}' (secondary likely offline)")
+            response = await client.post(SECONDARY_PROCESS_URL, json=payload)
+            print(f"    ✓ Secondary responded for '{detected_object}': {response.status_code}")
+        except httpx.TimeoutException:
+            print(f"    ⚠️ Timeout forwarding '{detected_object}' (secondary taking too long)")
+        except httpx.RequestError as e:
+            print(f"    ⚠️ Forwarding failed for '{detected_object}': {e}")
+            print(f"    Continuing without secondary process...")
+        except Exception as e:
+            print(f"    ⚠️ Unexpected error forwarding '{detected_object}': {e}")
+            print(f"    Continuing without secondary process...")
 
 async def query_ollama(image_b64: str, prompt: str) -> str:
     """Sends the image and prompt to Ollama and returns the textual response."""
@@ -144,15 +228,58 @@ async def query_ollama(image_b64: str, prompt: str) -> str:
                 }
             )
             response.raise_for_status()
-            return response.json().get("response", "No response form model.")
+            return response.json().get("response", "No response from model.")
+        except httpx.TimeoutException:
+            print(f"⚠️ Ollama request timeout")
+            return "I'm having trouble processing the image right now (timeout)."
+        except httpx.RequestError as e:
+            print(f"⚠️ Ollama request error: {e}")
+            return "I'm having trouble connecting to the vision model."
         except Exception as e:
-            print(f"Ollama error: {e}")
-            return f"Error: {e}"
+            print(f"⚠️ Unexpected Ollama error: {e}")
+            return "An unexpected error occurred while analyzing the image."
 
 async def process_single_frame(websocket: WebSocket, image_data: str, message: dict):
     user_prompt = message.get("prompt")
     recognize_faces = message.get("recognize_faces", False)
+    is_speech = message.get("is_speech", False)  # NEW: flag to indicate speech input
 
+    # [NEW] Handle speech-to-text prompts differently
+    if is_speech and user_prompt:
+        speech_result = await handle_speech_prompt(user_prompt, image_data)
+        
+        if speech_result["type"] == "facial_recognition":
+            # Return facial recognition results
+            try:
+                await websocket.send_json({
+                    "response": speech_result.get("response_text", ""),
+                    "faces": speech_result.get("face_results"),
+                    "speech_handled": True,
+                    "should_speak": True,  # Signal to speak this response
+                    "triggers": []
+                })
+            except:
+                print("Failed to send speech response to client")
+            return
+        
+        elif speech_result["type"] == "speech_api":
+            # Return speech API results
+            api_response = speech_result.get("api_response", {})
+            response_text = api_response.get("response", "No response") if isinstance(api_response, dict) else str(api_response)
+            
+            try:
+                await websocket.send_json({
+                    "response": response_text,
+                    "speech_api_result": api_response,
+                    "speech_handled": True,
+                    "should_speak": True,  # Signal to speak this response
+                    "triggers": []
+                })
+            except:
+                print("Failed to send speech API response to client")
+            return
+
+    # Original processing logic for non-speech prompts
     # 1. Face Recognition
     face_results = None
     if recognize_faces:
@@ -177,14 +304,12 @@ async def process_single_frame(websocket: WebSocket, image_data: str, message: d
     analysis_clean = analysis.strip()
     print(f"📝 Analysis: {analysis_clean[:100]}...")
 
-    # 5. [UPDATED] Word Search Trigger Loop
+    # 5. Word Search Trigger Loop
     analysis_lower = analysis_clean.lower()
-    # Finds ALL matches in the text
     triggers = [obj for obj in TARGET_OBJECTS if obj.lower() in analysis_lower]
 
     if triggers:
         print(f"🚨 TRIGGER MATCHES: {triggers}")
-        # Loop through every match and fire off a separate request for each
         for trigger in triggers:
              asyncio.create_task(forward_frame(image_data, trigger))
 

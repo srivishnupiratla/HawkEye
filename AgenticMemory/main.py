@@ -8,7 +8,7 @@ import base64
 memory_system = AgenticMemorySystem(
     model_name="all-MiniLM-L6-v2",  # Embedding model for ChromaDB
     llm_backend="ollama",  # LLM backend (openai/ollama)
-    llm_model="gemma3",  # LLM model name
+    llm_model="gemma3:4b",  # LLM model name
 )
 
 possible_objects = "DOOR, BOTTLE, COMPUTER, RAG, SANDWICH, HEADPHONES"
@@ -27,7 +27,7 @@ def init_object_schema(object, image = '') -> str:
         return ''
 
     response: ChatResponse = chat(
-        model="gemma3",
+        model="gemma3:4b",
         messages=[
             {
                 "role": "user",
@@ -55,7 +55,7 @@ def init_object_schema(object, image = '') -> str:
 
 def get_object_data(object, schema, image):
     response: ChatResponse = chat(
-        model="gemma3",
+        model="gemma3:4b",
         messages=[
             {
                 "role": "user",
@@ -88,7 +88,7 @@ def get_object_info(object):
 
 def get_object_from_query(query):
     response: ChatResponse = chat(
-        model="gemma3",
+        model="gemma3:4b",
         messages=[
             {
                 "role": "user",
@@ -110,7 +110,7 @@ def search_from_query(query):
     if result == '':
         return "I cannot answer this."
     response: ChatResponse = chat(
-        model="gemma3",
+        model="gemma3:4b",
         messages=[
             {
                 "role": "user",
